@@ -25,14 +25,14 @@ else:
 current_user_no_at = re.sub(r'\W+', '_', current_user_no_at)
 
 dbName = db_prefix+"_"+current_user_no_at
-cloud_storage_path = f"/Users/{current_user}/field_demos/{db_prefix}"
+cloud_storage_path = f"gs://marco_databricks/{db_prefix}"
 reset_all = dbutils.widgets.get("reset_all_data") == "true"
 
 if reset_all:
   spark.sql(f"DROP DATABASE IF EXISTS {dbName} CASCADE")
   dbutils.fs.rm(cloud_storage_path, True)
 
-spark.sql(f"""create database if not exists {dbName} LOCATION '{cloud_storage_path}/tables' """)
+spark.sql(f"""create database if not exists {dbName} MANAGED LOCATION '{cloud_storage_path}/tables' """)
 spark.sql(f"""USE {dbName}""")
 
 # COMMAND ----------

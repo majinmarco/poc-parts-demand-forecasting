@@ -1,7 +1,7 @@
 # Databricks notebook source
-dbutils.widgets.dropdown('reset_all_data', 'false', ['true', 'false'], 'Reset all data')
-dbutils.widgets.text('dbName',  'demand_db' , 'Database Name')
-dbutils.widgets.text('cloud_storage_path',  '/FileStore/tables/demand_forecasting_solution_accelerator/', 'Storage Path')
+dbutils.widgets.dropdown('reset_all_data', 'true', ['true', 'false'], 'Reset all data')
+dbutils.widgets.text('dbName',  'demand_planning_marco' , 'Database Name')
+dbutils.widgets.text('cloud_storage_path',  'gs://marco_databricks/demand_planning', 'Storage Path')
 
 # COMMAND ----------
 
@@ -334,6 +334,7 @@ display(demand_df.join(demand_df.sample(False, 1 / demand_df.count(), seed=0).li
 # COMMAND ----------
 
 demand_df_delta_path = os.path.join(cloud_storage_path, 'demand_df_delta')
+demand_df_delta_path
 
 # COMMAND ----------
 
@@ -346,6 +347,8 @@ demand_df.write \
 # COMMAND ----------
 
 spark.sql(f"DROP TABLE IF EXISTS {dbName}.part_level_demand")
+print(f"CREATE TABLE {dbName}.part_level_demand USING DELTA LOCATION '{demand_df_delta_path}'")
+display(spark.sql(f"USE CATALOG marco_data"))
 spark.sql(f"CREATE TABLE {dbName}.part_level_demand USING DELTA LOCATION '{demand_df_delta_path}'")
 
 # COMMAND ----------

@@ -11,9 +11,9 @@
 
 # MAGIC %md
 # MAGIC *Prerequisite: Make sure to run 01_Introduction_And_Setup before running this notebook.*
-# MAGIC 
+# MAGIC
 # MAGIC In this notebook we first find an appropriate time series model and then apply that very same approach to train multiple models in parallel with great speed and cost-effectiveness.  
-# MAGIC 
+# MAGIC
 # MAGIC Key highlights for this notebook:
 # MAGIC - Use Databricks' collaborative and interactive notebook environment to find an appropriate time series model
 # MAGIC - Pandas UDFs (user-defined functions) can take your single-node data science code, and distribute it across different keys (e.g. SKU)  
@@ -21,12 +21,8 @@
 
 # COMMAND ----------
 
-# MAGIC %run ./_resources/00-setup $reset_all_data=false
-
-# COMMAND ----------
-
-print(cloud_storage_path)
-print(dbName)
+cloud_storage_path = "gs://marco_databricks/demand_planning"
+dbName = "demand_planning_marco"
 
 # COMMAND ----------
 
@@ -58,7 +54,7 @@ from pyspark.sql.types import *
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC 
+# MAGIC
 # MAGIC ## Build a model
 # MAGIC *while leveraging Databricks' collaborative and interactive environment*
 
@@ -69,7 +65,7 @@ from pyspark.sql.types import *
 
 # COMMAND ----------
 
-demand_df = spark.read.table(f"{dbName}.part_level_demand")
+demand_df = spark.read.table(f"marco_data.{dbName}.part_level_demand")
 demand_df = demand_df.cache() # just for this example notebook
 
 # COMMAND ----------
@@ -100,6 +96,11 @@ forecast_horizon = 40
 is_history = [True] * (len(series_df) - forecast_horizon) + [False] * forecast_horizon
 train = series_df.iloc[is_history]
 score = series_df.iloc[~np.array(is_history)]
+
+
+# COMMAND ----------
+
+min(score.index.values)
 
 # COMMAND ----------
 
@@ -215,11 +216,82 @@ plt.title("Holts Winters Seasonal Method")
 
 # COMMAND ----------
 
+from prophet import Prophet
+
+# COMMAND ----------
+
 fit1 = SARIMAX(train, order=(1, 2, 1), seasonal_order=(0, 0, 0, 0), initialization_method="estimated").fit(warn_convergence = False)
 fcast1 = fit1.predict(start = min(train.index), end = max(score_exo.index)).rename("Without exogenous variables")
 
 fit2 = SARIMAX(train, exog=train_exo, order=(1, 2, 1), seasonal_order=(0, 0, 0, 0), initialization_method="estimated").fit(warn_convergence = False)
 fcast2 = fit2.predict(start = min(train.index), end = max(score_exo.index), exog = score_exo).rename("With exogenous variables")
+
+# COMMAND ----------
+
+display(train_exo)
+
+# COMMAND ----------
+
+train = train.to_frame().rename(columns = {0:"y"})
+score = score.to_frame().rename(columns = {0:"y"})
+
+# COMMAND ----------
+
+train
+
+# COMMAND ----------
+
+score
+
+# COMMAND ----------
+
+train_exo = train_exo.reindex(train.index)
+score_exo = score_exo.reindex(score.index)
+train = train.merge(train_exo, on = 'Date', how = 'inner')
+score = score.merge(score_exo, on = 'Date', how = 'inner')
+
+# COMMAND ----------
+
+train.index.name = 'ds'
+score.index.name = 'ds'
+
+# COMMAND ----------
+
+display(train)
+
+# COMMAND ----------
+
+display(score)
+
+# COMMAND ----------
+
+p_score = score.reset_index()
+p_train = train.reset_index()
+p_train
+
+# COMMAND ----------
+
+future = pd.concat([p_train[['ds', 'covid', 'christmas', 'new_year']], p_score[['ds', 'covid', 'christmas', 'new_year']]])
+
+# COMMAND ----------
+
+m = Prophet()
+m.add_regressor('covid')
+m.add_regressor('christmas')
+m.add_regressor('new_year')
+
+fit3 = m.fit(p_train)
+fcast3 = m.predict(future)
+
+# COMMAND ----------
+
+display(fcast3)
+
+# COMMAND ----------
+
+# fcast3 = pd.Series(data = fcast3['yhat'], index = fcast3['ds'])
+fcast3 = fcast3.set_index('ds')['yhat'].squeeze()
+display(fcast3.head())
 
 # COMMAND ----------
 
@@ -229,12 +301,38 @@ plt.plot(fcast1[10:], color="blue")
 (line1,) = plt.plot(fcast1[10:], marker="o", color="blue")
 plt.plot(fcast2[10:], color="green")
 (line2,) = plt.plot(fcast2[10:], marker="o", color="green")
+plt.plot(fcast3, color="green")
+(line3,) = plt.plot(fcast3, marker="o", color="orange")
 
-plt.axvline(x = min(score.index.values), color = 'red', label = 'axvline - full height')
-plt.legend([line0, line1, line2], ["Actuals", fcast1.name, fcast2.name])
+plt.axvline(x = min(score.index), color = 'red', label = 'axvline - full height')
+plt.legend([line0, line1, line2, line3], ["Actuals", fcast1.name, fcast2.name, "Prophet"])
 plt.xlabel("Time")
 plt.ylabel("Demand")
-plt.title("SARIMAX")
+plt.title("SARIMAX & Prophet Forecast")
+
+# COMMAND ----------
+
+forecast_df_delta_path = os.path.join(cloud_storage_path, 'full_forecast_df_delta')
+
+# COMMAND ----------
+
+fcast2 = fcast2.to_frame().reset_index().rename(columns={'index':'date', 'With exogenous variables': 'fitted_demand'})
+fcast2["actual_demand"] = series_df.values
+fcast2["demand_error"] = fcast2["actual_demand"] - fcast2["fitted_demand"]
+
+# COMMAND ----------
+
+# Write the data 
+spark.createDataFrame(fcast2).write \
+.option("overwriteSchema", "true") \
+.mode("overwrite") \
+.format("delta") \
+.save(forecast_df_delta_path)
+
+# COMMAND ----------
+
+spark.sql(f"DROP TABLE IF EXISTS marco_data.{dbName}.overall_forecast")
+spark.sql(f"CREATE TABLE marco_data.{dbName}.overall_forecast USING DELTA LOCATION '{forecast_df_delta_path}'")
 
 # COMMAND ----------
 
@@ -293,18 +391,18 @@ space = {
 
 # COMMAND ----------
 
-rstate = np.random.default_rng(123)
+# rstate = np.random.default_rng(123)
 
-with mlflow.start_run(run_name='mkh_test_sa'):
-  argmin = fmin(
-    fn=evaluate_model,
-    space=space,
-    algo=tpe.suggest,  # algorithm controlling how hyperopt navigates the search space
-    max_evals=10,
-    trials=SparkTrials(parallelism=1),
-    rstate=rstate,
-    verbose=False
-    )
+# with mlflow.start_run(run_name='mkh_test_sa'):
+#   argmin = fmin(
+#     fn=evaluate_model,
+#     space=space,
+#     algo=tpe.suggest,  # algorithm controlling how hyperopt navigates the search space
+#     max_evals=10,
+#     trials=SparkTrials(parallelism=1),
+#     rstate=rstate,
+#     verbose=False
+#     )
 
 # COMMAND ----------
 
@@ -313,7 +411,7 @@ with mlflow.start_run(run_name='mkh_test_sa'):
 
 # COMMAND ----------
 
-displayHTML(f"The optimal parameters for the selected series with SKU '{pdf.SKU.iloc[0]}' are: d = '{argmin.get('d')}', p = '{argmin.get('p')}' and q = '{argmin.get('q')}'")
+# displayHTML(f"The optimal parameters for the selected series with SKU '{pdf.SKU.iloc[0]}' are: d = '{argmin.get('d')}', p = '{argmin.get('p')}' and q = '{argmin.get('q')}'")
 
 # COMMAND ----------
 
@@ -323,7 +421,7 @@ displayHTML(f"The optimal parameters for the selected series with SKU '{pdf.SKU.
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC 
+# MAGIC
 # MAGIC ## Train thousands of models at scale, any time
 # MAGIC *while still using your preferred libraries and approaches*
 
@@ -387,20 +485,20 @@ display(enriched_df)
 # COMMAND ----------
 
 # MAGIC %md 
-# MAGIC 
+# MAGIC
 # MAGIC ### Solution: High-Level Overview
-# MAGIC 
+# MAGIC
 # MAGIC Benefits:
 # MAGIC - Pure Python & Pandas: easy to develop, test
 # MAGIC - Continue using your favorite libraries
 # MAGIC - Simply assume you're working with a Pandas DataFrame for a single SKU
-# MAGIC 
+# MAGIC
 # MAGIC <img src="https://github.com/PawaritL/data-ai-world-tour-dsml-jan-2022/blob/main/pandas-udf-workflow.png?raw=true" width=40%>
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC 
+# MAGIC
 # MAGIC #### Build, tune and score a model per each SKU with Pandas UDFs
 
 # COMMAND ----------
@@ -411,96 +509,143 @@ def build_tune_and_score_model(sku_pdf: pd.DataFrame) -> pd.DataFrame:
   """
   # Always ensure proper ordering and indexing by Date
   sku_pdf.sort_values("Date", inplace=True)
-  complete_ts = sku_pdf.set_index("Date").asfreq(freq="W-MON")
+
+  # Rename columns to match Prophet requirements
+  sku_pdf = sku_pdf.rename(columns={"Date": "ds", "Demand": "y"})
   
+  # Ensure datetime type for 'ds' column
+  sku_pdf['ds'] = pd.to_datetime(sku_pdf['ds'])
+
+  # Print debugging information
+  print("Input DataFrame columns:", sku_pdf.columns)
+  print("Input DataFrame head:", sku_pdf.head())
+  complete_ts = sku_pdf.rename({"Date":"ds", "Demand":"y"}, axis=1)
+  
+  complete_ts['ds'] = pd.to_datetime(complete_ts['ds'])
+
   print(complete_ts)
   
 
   # Since we'll group the large Spark DataFrame by (Product, SKU)
   PRODUCT = sku_pdf["Product"].iloc[0]
   SKU = sku_pdf["SKU"].iloc[0]
-  train_data, validation_data = split_train_score_data(complete_ts)
   exo_fields = ["covid", "christmas", "new_year"]
 
 
-  # Evaluate model on the training data set
-  def evaluate_model(hyperopt_params):
+  # # Evaluate model on the training data set
+  # def evaluate_model(hyperopt_params):
 
-        # SARIMAX requires a tuple of Python integers
-        order_hparams = tuple([int(hyperopt_params[k]) for k in ("p", "d", "q")])
+  #       # SARIMAX requires a tuple of Python integers
+  #       order_hparams = tuple([int(hyperopt_params[k]) for k in ("p", "d", "q")])
 
-        # Training
-        model = SARIMAX(
-          train_data["Demand"], 
-          exog=train_data[exo_fields], 
-          order=order_hparams, 
-          seasonal_order=(0, 0, 0, 0), # assume no seasonality in our example
-          initialization_method="estimated",
-          enforce_stationarity = False,
-          enforce_invertibility = False
-        )
-        fitted_model = model.fit(disp=False, method='nm')
+  #       # Training
+  #       model = SARIMAX(
+  #         train_data["Demand"], 
+  #         exog=train_data[exo_fields], 
+  #         order=order_hparams, 
+  #         seasonal_order=(0, 0, 0, 0), # assume no seasonality in our example
+  #         initialization_method="estimated",
+  #         enforce_stationarity = False,
+  #         enforce_invertibility = False
+  #       )
+  #       fitted_model = model.fit(disp=False, method='nm')
 
-        # Validation
-        fcast = fitted_model.predict(
-          start=validation_data.index.min(), 
-          end=validation_data.index.max(), 
-          exog=validation_data[exo_fields]
-        )
+  #       # Validation
+  #       fcast = fitted_model.predict(
+  #         start=validation_data.index.min(), 
+  #         end=validation_data.index.max(), 
+  #         exog=validation_data[exo_fields]
+  #       )
 
-        return {'status': hyperopt.STATUS_OK, 'loss': np.power(validation_data.Demand.to_numpy() - fcast.to_numpy(), 2).mean()}
+  #       return {'status': hyperopt.STATUS_OK, 'loss': np.power(validation_data.Demand.to_numpy() - fcast.to_numpy(), 2).mean()}
 
-  search_space = {
-      'p': scope.int(hyperopt.hp.quniform('p', 0, 4, 1)),
-      'd': scope.int(hyperopt.hp.quniform('d', 0, 2, 1)),
-      'q': scope.int(hyperopt.hp.quniform('q', 0, 4, 1)) 
-    }
+  # search_space = {
+  #     'p': scope.int(hyperopt.hp.quniform('p', 0, 4, 1)),
+  #     'd': scope.int(hyperopt.hp.quniform('d', 0, 2, 1)),
+  #     'q': scope.int(hyperopt.hp.quniform('q', 0, 4, 1)) 
+  #   }
 
-  rstate = np.random.default_rng(123) # just for reproducibility of this notebook
+  # rstate = np.random.default_rng(123) # just for reproducibility of this notebook
 
-  best_hparams = fmin(evaluate_model, search_space, algo=tpe.suggest, max_evals=10)
+  # best_hparams = fmin(evaluate_model, search_space, algo=tpe.suggest, max_evals=10)
 
-  # Training
-  model_final = SARIMAX(
-    train_data["Demand"], 
-    exog=train_data[exo_fields], 
-    order=tuple(best_hparams.values()), 
-    seasonal_order=(0, 0, 0, 0), # assume no seasonality in our example
-    initialization_method="estimated",
-    enforce_stationarity = False,
-     enforce_invertibility = False
-  )
-  fitted_model_final = model_final.fit(disp=False, method='nm')
+  # # Training
+  # model_final = SARIMAX(
+  #   train_data["Demand"], 
+  #   exog=train_data[exo_fields], 
+  #   order=tuple(best_hparams.values()), 
+  #   seasonal_order=(0, 0, 0, 0), # assume no seasonality in our example
+  #   initialization_method="estimated",
+  #   enforce_stationarity = False,
+  #    enforce_invertibility = False
+  # )
+  # fitted_model_final = model_final.fit(disp=False, method='nm')
 
-  # Validation
-  fcast = fitted_model_final.predict(
-    start=complete_ts.index.min(), 
-    end=complete_ts.index.max(), 
-    exog=validation_data[exo_fields]
-  )
+  # Training and prediction
+  m = Prophet()
+  m.add_regressor('covid')
+  m.add_regressor('christmas')
+  m.add_regressor('new_year')
 
-  forecast_series = complete_ts[['Product', 'SKU' , 'Demand']].assign(Date = complete_ts.index.values).assign(Demand_Fitted = fcast)
-    
-  forecast_series = forecast_series[['Product', 'SKU' , 'Date', 'Demand', 'Demand_Fitted']]
-  
-  return forecast_series
+
+  try:
+      m.fit(sku_pdf)
+      future = m.make_future_dataframe(periods=40, freq='W-MON')
+
+      covid_breakpoint = dt.date(year=2020, month=3, day=1)
+      future['covid'] = np.where(future['ds'] >= np.datetime64(covid_breakpoint), 1, 0)
+      future['christmas'] = np.where((future['ds'].dt.isocalendar().week >= 51) & (future['ds'].dt.isocalendar().week <= 52), 1, 0)
+      future['new_year'] = np.where((future['ds'].dt.isocalendar().week >= 1) & (future['ds'].dt.isocalendar().week <= 4), 1, 0)
+
+      fcast = m.predict(future)
+
+      # Merge results
+      forecast_series = sku_pdf.merge(fcast, on="ds", how="outer")
+      forecast_series['SKU'] = SKU
+      forecast_series['Product'] = PRODUCT
+
+      # Select and rename columns to match the expected schema
+      result = forecast_series[['ds', 'Product', 'SKU', 'y', 'yhat', 'yhat_lower', 'yhat_upper']]
+      result = result.rename(columns={
+          'ds': 'Date',
+          'y': 'Demand',
+          'yhat': 'Demand_Fitted',
+          'yhat_lower': 'Forecast_Lower',
+          'yhat_upper': 'Forecast_Upper'
+      })
+
+      # Ensure correct data types
+      result['Date'] = pd.to_datetime(result['Date'])
+      result['Demand'] = result['Demand'].astype(float)
+      result['Demand_Fitted'] = result['Demand_Fitted'].astype(float)
+      result['Forecast_Lower'] = result['Forecast_Lower'].astype(float)
+      result['Forecast_Upper'] = result['Forecast_Upper'].astype(float)
+
+      return result
+
+  except Exception as e:
+      print(f"Error in build_tune_and_score_model: {str(e)}")
+      # Return an empty DataFrame with the correct schema
+      return pd.DataFrame(columns=['Date', 'Product', 'SKU', 'Demand', 'Demand_Fitted', 'Forecast_Lower', 'Forecast_Upper'])
+
+  return result
 
 # COMMAND ----------
 
-tuning_schema = StructType(
-  [
-    StructField('Product', StringType()),
-    StructField('SKU', StringType()),
-    StructField('Date', DateType()),
-    StructField('Demand', FloatType()),
-    StructField('Demand_Fitted', FloatType())
-  ]
-)
+tuning_schema = StructType([
+    StructField("Date", DateType(), True),
+    StructField("Product", StringType(), True),
+    StructField("SKU", StringType(), True),
+    StructField("Demand", DoubleType(), True),
+    StructField("Demand_Fitted", DoubleType(), True),
+    StructField("Forecast_Lower", DoubleType(), True),
+    StructField("Forecast_Upper", DoubleType(), True)
+])
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC 
+# MAGIC
 # MAGIC #### Run distributed processing: `groupBy("SKU")` + `applyInPandas(...)`
 
 # COMMAND ----------
@@ -512,6 +657,9 @@ tuning_schema = StructType(
 spark.conf.set("spark.databricks.optimizer.adaptive.enabled", "false")
 n_tasks = enriched_df.select("Product", "SKU").distinct().count()
 
+print("Number of tasks:", n_tasks)
+print("enriched_df schema:", enriched_df.printSchema())
+
 forecast_df = (
   enriched_df
   .repartition(n_tasks, "Product", "SKU")
@@ -519,7 +667,38 @@ forecast_df = (
   .applyInPandas(build_tune_and_score_model, schema=tuning_schema)
 )
 
+# Check the resulting DataFrame
+print("forecast_df count:", forecast_df.count())
+print("forecast_df schema:", forecast_df.printSchema())
+forecast_df.show(5)
+
+# COMMAND ----------
+
 display(forecast_df)
+
+# COMMAND ----------
+
+from pyspark.sql.functions import col
+
+forecast_df = forecast_df.withColumn(
+    "forecast_error", 
+    (col("Demand_Fitted") - col("Demand")).cast("float")
+)
+
+forecast_error_mean = forecast_df.selectExpr("avg(forecast_error)").collect()[0][0]
+
+# COMMAND ----------
+
+forecast_error_mean
+
+# COMMAND ----------
+
+from pyspark.sql.functions import col, when
+
+forecast_df = forecast_df.withColumn(
+    "future",
+    when(col("Demand").isNull(), True).otherwise(False)
+)
 
 # COMMAND ----------
 
@@ -533,16 +712,20 @@ forecast_df_delta_path = os.path.join(cloud_storage_path, 'forecast_df_delta')
 # COMMAND ----------
 
 # Write the data 
-forecast_df.write \
+forecast_df.write.option("overwriteSchema", "true") \
 .mode("overwrite") \
 .format("delta") \
 .save(forecast_df_delta_path)
 
 # COMMAND ----------
 
-spark.sql(f"DROP TABLE IF EXISTS {dbName}.part_level_demand_with_forecasts")
-spark.sql(f"CREATE TABLE {dbName}.part_level_demand_with_forecasts USING DELTA LOCATION '{forecast_df_delta_path}'")
+spark.sql(f"DROP TABLE IF EXISTS marco_data.{dbName}.part_level_demand_with_forecasts")
+spark.sql(f"CREATE TABLE marco_data.{dbName}.part_level_demand_with_forecasts USING DELTA LOCATION '{forecast_df_delta_path}'")
 
 # COMMAND ----------
 
-display(spark.sql(f"SELECT * FROM {dbName}.part_level_demand_with_forecasts"))
+display(spark.sql(f"SELECT * FROM marco_data.{dbName}.part_level_demand_with_forecasts"))
+
+# COMMAND ----------
+
+
